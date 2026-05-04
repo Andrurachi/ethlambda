@@ -1068,31 +1068,150 @@ fn build_block(
         let mut sorted_entries: Vec<_> = aggregated_payloads.iter().collect();
         sorted_entries.sort_by_key(|(_, (data, _))| data.target.slot);
 
+        let mut iteration: u32 = 0;
         loop {
+            iteration += 1;
             let mut found_new = false;
+            let mut iter_selected: u32 = 0;
+            let mut iter_skipped: u32 = 0;
+
+            info!(
+                slot,
+                proposer_index,
+                iteration,
+                candidates = sorted_entries.len(),
+                already_selected = processed_data_roots.len(),
+                current_justified_slot = current_justified.slot,
+                current_justified_root = %ShortRoot(&current_justified.root.0),
+                "build_block: starting fixed-point iteration"
+            );
 
             for &(data_root, (att_data, proofs)) in &sorted_entries {
                 if processed_data_roots.contains(data_root) {
+                    // Already chosen in an earlier iteration; do not re-log to
+                    // keep the per-iteration output focused on new decisions.
                     continue;
                 }
+
+                // Summary stats over all proofs for this AttestationData.
+                let mut available_bit_set: HashSet<u64> = HashSet::new();
+                for p in proofs {
+                    available_bit_set.extend(p.participant_indices());
+                }
+                let available_bits = available_bit_set.len();
+                let proof_count = proofs.len();
+
                 // Cap distinct AttestationData entries per block (leanSpec #536).
                 if processed_data_roots.len() >= MAX_ATTESTATIONS_DATA {
+                    info!(
+                        slot,
+                        proposer_index,
+                        iteration,
+                        attestation_slot = att_data.slot,
+                        source_slot = att_data.source.slot,
+                        source_root = %ShortRoot(&att_data.source.root.0),
+                        target_slot = att_data.target.slot,
+                        target_root = %ShortRoot(&att_data.target.root.0),
+                        head_slot = att_data.head.slot,
+                        head_root = %ShortRoot(&att_data.head.root.0),
+                        data_root = %ShortRoot(&data_root.0),
+                        available_bits,
+                        proof_count,
+                        reason = "max_attestation_data_cap",
+                        "build_block: skipped attestation"
+                    );
+                    iter_skipped += 1;
                     break;
                 }
                 if !known_block_roots.contains(&att_data.head.root) {
+                    info!(
+                        slot,
+                        proposer_index,
+                        iteration,
+                        attestation_slot = att_data.slot,
+                        source_slot = att_data.source.slot,
+                        source_root = %ShortRoot(&att_data.source.root.0),
+                        target_slot = att_data.target.slot,
+                        target_root = %ShortRoot(&att_data.target.root.0),
+                        head_slot = att_data.head.slot,
+                        head_root = %ShortRoot(&att_data.head.root.0),
+                        data_root = %ShortRoot(&data_root.0),
+                        available_bits,
+                        proof_count,
+                        reason = "head_root_unknown",
+                        "build_block: skipped attestation"
+                    );
+                    iter_skipped += 1;
                     continue;
                 }
                 if att_data.source != current_justified {
+                    info!(
+                        slot,
+                        proposer_index,
+                        iteration,
+                        attestation_slot = att_data.slot,
+                        source_slot = att_data.source.slot,
+                        source_root = %ShortRoot(&att_data.source.root.0),
+                        target_slot = att_data.target.slot,
+                        target_root = %ShortRoot(&att_data.target.root.0),
+                        head_slot = att_data.head.slot,
+                        head_root = %ShortRoot(&att_data.head.root.0),
+                        data_root = %ShortRoot(&data_root.0),
+                        available_bits,
+                        proof_count,
+                        expected_source_slot = current_justified.slot,
+                        expected_source_root = %ShortRoot(&current_justified.root.0),
+                        reason = "source_mismatch",
+                        "build_block: skipped attestation"
+                    );
+                    iter_skipped += 1;
                     continue;
                 }
 
                 processed_data_roots.insert(*data_root);
                 found_new = true;
 
+                let before = selected.len();
                 extend_proofs_greedily(proofs, &mut selected, att_data);
+                let added_proofs = selected.len() - before;
+
+                // Bits actually contributed by this entry after greedy proof selection.
+                let mut selected_bit_set: HashSet<u64> = HashSet::new();
+                for (att, _) in &selected[before..] {
+                    selected_bit_set.extend(validator_indices(&att.aggregation_bits));
+                }
+
+                info!(
+                    slot,
+                    proposer_index,
+                    iteration,
+                    attestation_slot = att_data.slot,
+                    source_slot = att_data.source.slot,
+                    source_root = %ShortRoot(&att_data.source.root.0),
+                    target_slot = att_data.target.slot,
+                    target_root = %ShortRoot(&att_data.target.root.0),
+                    head_slot = att_data.head.slot,
+                    head_root = %ShortRoot(&att_data.head.root.0),
+                    data_root = %ShortRoot(&data_root.0),
+                    available_bits,
+                    selected_bits = selected_bit_set.len(),
+                    available_proofs = proof_count,
+                    selected_proofs = added_proofs,
+                    "build_block: selected attestation"
+                );
+                iter_selected += 1;
             }
 
             if !found_new {
+                info!(
+                    slot,
+                    proposer_index,
+                    iteration,
+                    iter_selected,
+                    iter_skipped,
+                    selected_total = processed_data_roots.len(),
+                    "build_block: fixed-point converged (no new candidates this iteration)"
+                );
                 break;
             }
 
@@ -1115,9 +1234,31 @@ fn build_block(
             process_block(&mut post_state, &candidate)?;
 
             if post_state.latest_justified != current_justified {
+                info!(
+                    slot,
+                    proposer_index,
+                    iteration,
+                    iter_selected,
+                    iter_skipped,
+                    prev_justified_slot = current_justified.slot,
+                    prev_justified_root = %ShortRoot(&current_justified.root.0),
+                    new_justified_slot = post_state.latest_justified.slot,
+                    new_justified_root = %ShortRoot(&post_state.latest_justified.root.0),
+                    "build_block: justified advanced; continuing fixed-point loop"
+                );
                 current_justified = post_state.latest_justified;
                 // Continue: new checkpoint may unlock more attestation data
             } else {
+                info!(
+                    slot,
+                    proposer_index,
+                    iteration,
+                    iter_selected,
+                    iter_skipped,
+                    current_justified_slot = current_justified.slot,
+                    current_justified_root = %ShortRoot(&current_justified.root.0),
+                    "build_block: justified stable; fixed-point converged"
+                );
                 break;
             }
         }
